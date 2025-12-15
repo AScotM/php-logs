@@ -21,7 +21,7 @@ class RSyslogInfo {
 
     public function detectRSyslogInfo(): bool {
         $output = shell_exec("rsyslogd -v 2>&1");
-        if ($output !== null) {
+        if ($output !== null && trim($output) !== "") {
             return $this->parseVersionOutput($output);
         }
         return $this->detectFromSystem();
@@ -188,6 +188,52 @@ class LogEntry {
     }
 }
 
+class Mutex {
+    private bool $locked = false;
+    private $lockHandle = null;
+
+    public function lock(): void {
+        $lockFile = sys_get_temp_dir() . '/rsyslog_analyzer_' . getmypid() . '.lock';
+        $maxAttempts = 100;
+        $attempts = 0;
+        
+        while ($attempts < $maxAttempts) {
+            $this->lockHandle = @fopen($lockFile, 'w');
+            if ($this->lockHandle === false) {
+                usleep(1000);
+                $attempts++;
+                continue;
+            }
+            
+            if (flock($this->lockHandle, LOCK_EX | LOCK_NB)) {
+                $this->locked = true;
+                fwrite($this->lockHandle, (string)getmypid());
+                fflush($this->lockHandle);
+                return;
+            }
+            
+            fclose($this->lockHandle);
+            usleep(1000);
+            $attempts++;
+        }
+        
+        throw new RuntimeException("Unable to acquire lock after $maxAttempts attempts");
+    }
+
+    public function unlock(): void {
+        if ($this->locked && $this->lockHandle !== null) {
+            flock($this->lockHandle, LOCK_UN);
+            fclose($this->lockHandle);
+            $this->lockHandle = null;
+            $this->locked = false;
+        }
+    }
+
+    public function __destruct() {
+        $this->unlock();
+    }
+}
+
 class AnalysisResults {
     public int $totalEntries = 0;
     public array $uniqueServices = [];
@@ -224,6 +270,13 @@ class AnalysisResults {
         
         $hourKey = $entry->timestamp->format("H:00");
         $this->hourlyDistribution[$hourKey] = ($this->hourlyDistribution[$hourKey] ?? 0) + 1;
+        
+        if ($this->dateRange[0] === "" || $entry->timestamp->format("Y-m-d") < $this->dateRange[0]) {
+            $this->dateRange[0] = $entry->timestamp->format("Y-m-d");
+        }
+        if ($this->dateRange[1] === "" || $entry->timestamp->format("Y-m-d") > $this->dateRange[1]) {
+            $this->dateRange[1] = $entry->timestamp->format("Y-m-d");
+        }
         
         $this->mutex->unlock();
     }
@@ -373,21 +426,6 @@ class ConcurrentTree {
     }
 }
 
-class Mutex {
-    private bool $locked = false;
-
-    public function lock(): void {
-        while ($this->locked) {
-            usleep(1000);
-        }
-        $this->locked = true;
-    }
-
-    public function unlock(): void {
-        $this->locked = false;
-    }
-}
-
 class LogParser {
     private int $currentYear;
     private bool $verbose;
@@ -398,6 +436,7 @@ class LogParser {
         "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
         "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12
     ];
+    private array $monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
     public function __construct(int $currentYear, bool $verbose, bool $useRSyslogDetection) {
         $this->currentYear = $currentYear;
@@ -415,71 +454,68 @@ class LogParser {
     }
 
     private function compilePatterns(): array {
-        if ($this->rsyslogInfo !== null) {
-            $patterns = [];
-            
-            $patterns[] = new PatternInfo(
-                '/^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$/',
-                "traditional",
-                "Basic syslog format"
-            );
-            
-            $patterns[] = new PatternInfo(
-                '/^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+):\s*(?P<message>.+)$/',
-                "traditional_simple",
-                "Simple syslog format"
-            );
-            
-            if ($this->rsyslogInfo->version !== "" && $this->rsyslogInfo->versionCompare($this->rsyslogInfo->version, "8.0") >= 0) {
-                $patterns[] = new PatternInfo(
-                    '/^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$/',
-                    "iso8601",
-                    "ISO 8601 timestamp format"
-                );
-                
-                $patterns[] = new PatternInfo(
-                    '/^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{4})\s+(?P<host>[\w\-.]+)\s+(?P<service>\w+)\[(?P<pid>\d+)\]:\s*(?P<message>.+)$/',
-                    "journald",
-                    "Journald-style format"
-                );
-            }
-            
-            if ($this->rsyslogInfo->features["FEATURE_REGEXP"] ?? false) {
-                $patterns[] = new PatternInfo(
-                    '/^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\d+-:]+)\s+(?P<host>\S+)\s+(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:?\s+(?:\[(?P<level>\w+)\]\s+)?(?P<message>.+)$/',
-                    "rainerscript_enhanced",
-                    "RainerScript enhanced format"
-                );
-            }
-            
-            return $patterns;
-        }
+        $patterns = [];
         
-        return [
-            new PatternInfo(
-                '/^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$/',
-                "traditional",
-                "Basic syslog format"
-            ),
-            new PatternInfo(
-                '/^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+):\s*(?P<message>.+)$/',
-                "traditional_simple",
-                "Simple syslog format"
-            ),
-            new PatternInfo(
-                '/^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.+)$/',
-                "iso8601",
-                "ISO 8601 timestamp format"
-            )
-        ];
+        $patterns[] = new PatternInfo(
+            '/^(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+' .
+            '(?P<day>\d{1,2})\s+' .
+            '(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+' .
+            '(?P<host>[\w\-.]+)\s+' .
+            '(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*' .
+            '(?:\[(?P<level>\w+)\]\s*)?' .
+            '(?P<message>.+)$/',
+            "traditional",
+            "Traditional syslog format"
+        );
+        
+        $patterns[] = new PatternInfo(
+            '/^(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+' .
+            '(?P<day>\d{1,2})\s+' .
+            '(?P<time>\d{2}:\d{2}:\d{2})\s+' .
+            '(?P<host>[\w\-.]+)\s+' .
+            '(?P<service>[\w\-.\\/]+):\s*' .
+            '(?P<message>.+)$/',
+            "traditional_simple",
+            "Simple syslog format"
+        );
+        
+        $patterns[] = new PatternInfo(
+            '/^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+' .
+            '(?P<host>[\w\-.]+)\s+' .
+            '(?P<service>[\w\-.\\/]+)(?:\[(?P<pid>\d+)\])?:\s*' .
+            '(?:\[(?P<level>\w+)\]\s*)?' .
+            '(?P<message>.+)$/',
+            "iso8601",
+            "ISO 8601 timestamp format"
+        );
+        
+        $patterns[] = new PatternInfo(
+            '/^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{4})\s+' .
+            '(?P<host>[\w\-.]+)\s+' .
+            '(?P<service>\w+)\[(?P<pid>\d+)\]:\s*' .
+            '(?P<message>.+)$/',
+            "journald",
+            "Journald-style format"
+        );
+        
+        $patterns[] = new PatternInfo(
+            '/^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\d+-:]+)\s+' .
+            '(?P<host>\S+)\s+' .
+            '(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:?\s+' .
+            '(?:\[(?P<level>\w+)\]\s+)?' .
+            '(?P<message>.+)$/',
+            "rainerscript_enhanced",
+            "RainerScript enhanced format"
+        );
+        
+        return $patterns;
     }
 
     public function parseLine(string $line, DateTime $now, DateTime $cutoffDate): ?LogEntry {
+        $line = trim($line);
         if (!$this->isLikelyLogLine($line)) {
             return null;
         }
-        
-        $line = trim($line);
         
         foreach ($this->compiledPatterns as $patternInfo) {
             if (!preg_match($patternInfo->pattern, $line, $matches)) {
@@ -514,66 +550,78 @@ class LogParser {
     }
 
     private function isLikelyLogLine(string $line): bool {
-        if ($line === "" || strlen($line) < 15) {
+        if ($line === "" || strlen($line) < 10) {
             return false;
         }
         
-        if (strlen($line) >= 3) {
-            $firstThree = substr($line, 0, 3);
-            if (isset($this->months[$firstThree])) {
-                return true;
-            }
+        $firstThree = substr($line, 0, 3);
+        if (in_array($firstThree, $this->monthNames, true)) {
+            return true;
         }
         
         return preg_match('/^\d{4}-\d{2}-\d{2}/', $line) === 1;
     }
 
     private function extractTimestamp(array $groupDict, string $patternType, DateTime $now): ?DateTime {
-        if (in_array($patternType, ["iso8601", "journald", "rainerscript_enhanced"])) {
-            return $this->parseIsoTimestamp($groupDict["timestamp"] ?? "");
+        if (isset($groupDict["timestamp"])) {
+            $dt = $this->parseIsoTimestamp($groupDict["timestamp"]);
+            if ($dt !== null) {
+                return $dt;
+            }
         }
         
-        $month = $groupDict["month"] ?? "";
-        $day = $groupDict["day"] ?? "";
-        $timeStr = $groupDict["time"] ?? "";
-        
-        if ($month === "" || $day === "" || $timeStr === "") {
-            return null;
+        if (isset($groupDict["month"], $groupDict["day"], $groupDict["time"])) {
+            return $this->parseTraditionalTimestamp(
+                $groupDict["month"],
+                $groupDict["day"],
+                $groupDict["time"],
+                $now
+            );
         }
         
+        return null;
+    }
+
+    private function parseTraditionalTimestamp(string $month, string $day, string $timeStr, DateTime $now): ?DateTime {
         $monthNum = $this->months[$month] ?? 0;
         if ($monthNum === 0) {
             return null;
         }
         
-        $year = $now->format("Y");
-        if ($monthNum > (int)$now->format("n")) {
+        $year = $this->currentYear;
+        
+        $nowMonth = (int)$now->format('n');
+        $nowDay = (int)$now->format('j');
+        
+        if ($monthNum > $nowMonth || ($monthNum === $nowMonth && (int)$day > $nowDay)) {
             $year--;
         }
         
+        $baseTime = $timeStr;
         $microseconds = 0;
-        if (str_contains($timeStr, ".")) {
-            $timeParts = explode(".", $timeStr);
-            $baseTime = $timeParts[0];
-            $microStr = $timeParts[1];
-            if (strlen($microStr) > 6) {
-                $microStr = substr($microStr, 0, 6);
-            }
-            $microStr = str_pad($microStr, 6, "0");
-            $microseconds = (int)$microStr;
-        } else {
-            $baseTime = $timeStr;
+        
+        if (str_contains($timeStr, '.')) {
+            $parts = explode('.', $timeStr, 2);
+            $baseTime = $parts[0];
+            $microPart = $parts[1];
+            
+            $microPart = substr($microPart, 0, 6);
+            $microPart = str_pad($microPart, 6, '0');
+            $microseconds = (int)$microPart;
         }
         
         try {
-            $tsStr = sprintf("%d-%02d-%02d %s", $year, $monthNum, (int)$day, $baseTime);
-            $dt = DateTime::createFromFormat("Y-m-d H:i:s", $tsStr);
+            $dateStr = sprintf('%d-%02d-%02d %s', $year, $monthNum, (int)$day, $baseTime);
+            $dt = DateTime::createFromFormat('Y-m-d H:i:s', $dateStr);
+            
             if ($dt === false) {
                 return null;
             }
+            
             if ($microseconds > 0) {
-                $dt->modify("+" . $microseconds . " microseconds");
+                $dt = new DateTime($dt->format('Y-m-d H:i:s.u'));
             }
+            
             return $dt;
         } catch (Exception $e) {
             return null;
@@ -581,15 +629,15 @@ class LogParser {
     }
 
     private function parseIsoTimestamp(string $tsStr): ?DateTime {
-        $tsStr = str_replace(" ", "T", $tsStr);
+        $tsStr = str_replace(' ', 'T', $tsStr);
         
         $formats = [
-            "Y-m-d\TH:i:s.uP",
-            "Y-m-d\TH:i:sP",
-            "Y-m-d\TH:i:s.u",
-            "Y-m-d\TH:i:s",
-            "Y-m-d\TH:i:s.u\Z",
-            "Y-m-d\TH:i:s\Z",
+            'Y-m-d\TH:i:s.uP',
+            'Y-m-d\TH:i:sP',
+            'Y-m-d\TH:i:s.u',
+            'Y-m-d\TH:i:s',
+            'Y-m-d\TH:i:s.u\Z',
+            'Y-m-d\TH:i:s\Z',
         ];
         
         foreach ($formats as $format) {
@@ -621,6 +669,7 @@ class RSyslogAnalyzer {
     private const MAX_DISPLAY_ERRORS = 10;
     private const MAX_DISPLAY_FILTERED = 20;
     private const MAX_TOP_SERVICES = 5;
+    private const MEMORY_LIMIT_MB = 256;
     
     private ConcurrentTree $tree;
     private array $config;
@@ -746,15 +795,22 @@ class RSyslogAnalyzer {
         }
         
         $fileSize = $info['size'];
-        if ($fileSize > 1024 * 1024) {
-            echo "Parsing logs...";
+        $fileSizeMB = $fileSize / (1024 * 1024);
+        
+        if ($fileSizeMB > $this->config['max_file_size_mb']) {
+            throw new SecurityError(sprintf(
+                "File too large: %.1fMB > %dMB limit", 
+                $fileSizeMB, 
+                $this->config['max_file_size_mb']
+            ));
+        }
+        
+        if ($fileSizeMB > 10) {
+            echo "Parsing logs (this may take a while)...";
             flush();
         }
         
         $handle = $this->openLogFile($this->logFile);
-        if ($handle === null) {
-            throw new Exception("Cannot read log file");
-        }
         
         $now = new DateTime();
         $cutoffDate = clone $now;
@@ -762,6 +818,11 @@ class RSyslogAnalyzer {
         
         while (($line = fgets($handle)) !== false) {
             $this->processedLines++;
+            
+            if ($this->processedLines % 10000 === 0) {
+                $this->checkMemoryLimit();
+            }
+            
             $entry = $this->parser->parseLine(trim($line), $now, $cutoffDate);
             if ($entry !== null) {
                 $this->processEntry($entry);
@@ -770,43 +831,54 @@ class RSyslogAnalyzer {
         
         fclose($handle);
         
-        if ($fileSize > 1024 * 1024) {
+        if ($fileSizeMB > 10) {
             echo " done" . PHP_EOL;
         }
         
         if ($this->config['verbose']) {
             $successRate = $this->processedLines > 0 ? ($this->parsedEntries / $this->processedLines * 100) : 0;
-            printf("Processing complete - Processed lines: %d, Parsed entries: %d, Success rate: %.2f%%\n",
-                $this->processedLines, $this->parsedEntries, $successRate);
+            printf(
+                "Processing complete - Processed lines: %d, Parsed entries: %d, Success rate: %.2f%%\n",
+                $this->processedLines, 
+                $this->parsedEntries, 
+                $successRate
+            );
         }
     }
 
     private function openLogFile(string $filePath) {
-        if (!$this->isSafePath($filePath)) {
-            throw new SecurityError("Access to " . $filePath . " not allowed");
-        }
-        
         $realPath = realpath($filePath);
         if ($realPath === false) {
-            throw new Exception("Failed to resolve file path");
+            throw new Exception("Failed to resolve file path: " . $filePath);
+        }
+        
+        if (!$this->isSafePath($realPath)) {
+            throw new SecurityError("Access to " . $realPath . " not allowed");
         }
         
         $fileSize = filesize($realPath);
         if ($fileSize === false) {
-            throw new Exception("Failed to get file size");
+            throw new Exception("Failed to get file size: " . $realPath);
         }
         
-        $fileSizeMB = $fileSize / (1024 * 1024);
-        if ($fileSizeMB > $this->config['max_file_size_mb']) {
-            throw new SecurityError(sprintf("File too large: %dMB > %dMB limit", $fileSizeMB, $this->config['max_file_size_mb']));
-        }
-        
-        if (str_ends_with($filePath, ".gz")) {
-            return gzopen($realPath, "r");
-        } elseif (str_ends_with($filePath, ".bz2")) {
-            return bzopen($realPath, "r");
+        if (str_ends_with($realPath, ".gz")) {
+            $handle = @gzopen($realPath, "r");
+            if ($handle === false) {
+                throw new Exception("Cannot open gzipped file: " . $realPath);
+            }
+            return $handle;
+        } elseif (str_ends_with($realPath, ".bz2")) {
+            $handle = @bzopen($realPath, "r");
+            if ($handle === false) {
+                throw new Exception("Cannot open bzipped file: " . $realPath);
+            }
+            return $handle;
         } else {
-            return fopen($realPath, "r");
+            $handle = @fopen($realPath, "r");
+            if ($handle === false) {
+                throw new Exception("Cannot open file: " . $realPath);
+            }
+            return $handle;
         }
     }
 
@@ -830,10 +902,20 @@ class RSyslogAnalyzer {
         return false;
     }
 
+    private function checkMemoryLimit(): void {
+        $memoryUsage = memory_get_usage(true) / (1024 * 1024);
+        if ($memoryUsage > self::MEMORY_LIMIT_MB * 0.9) {
+            if (!$this->memoryWarning) {
+                echo "\nWarning: Approaching memory limit (" . round($memoryUsage, 1) . "MB used)\n";
+                $this->memoryWarning = true;
+            }
+        }
+    }
+
     private function processEntry(LogEntry $entry): void {
         if ($this->storage->size() >= $this->config['max_memory_entries']) {
             if (!$this->memoryWarning) {
-                echo "Memory limit reached: " . $this->config['max_memory_entries'] . PHP_EOL;
+                echo "Memory limit reached: " . $this->config['max_memory_entries'] . " entries\n";
                 $this->memoryWarning = true;
             }
             return;
@@ -1137,14 +1219,14 @@ class RSyslogAnalyzer {
         
         $serviceRegex = null;
         if ($servicePattern !== null && $servicePattern !== "") {
-            $serviceRegex = $servicePattern;
+            $serviceRegex = '/^' . str_replace('*', '.*', $servicePattern) . '$/';
         }
         
         foreach ($entries as $log) {
             if ($serviceRegex !== null && !preg_match($serviceRegex, $log->service)) {
                 continue;
             }
-            if ($level !== null && $level !== "" && $log->level !== $level) {
+            if ($level !== null && $level !== "" && strtoupper($log->level) !== strtoupper($level)) {
                 continue;
             }
             if ($messageContains !== null && $messageContains !== "" && !str_contains(strtolower($log->message), strtolower($messageContains))) {
@@ -1157,6 +1239,36 @@ class RSyslogAnalyzer {
         
         return $filtered;
     }
+}
+
+function validateInput(array $options): array {
+    $errors = [];
+    
+    if ($options["max-days"] < 1 || $options["max-days"] > 365) {
+        $errors[] = "max-days must be between 1 and 365";
+    }
+    
+    if ($options["truncate-length"] < 20 || $options["truncate-length"] > 1000) {
+        $errors[] = "truncate-length must be between 20 and 1000";
+    }
+    
+    if ($options["max-lines-per-service"] < 1 || $options["max-lines-per-service"] > 100) {
+        $errors[] = "max-lines-per-service must be between 1 and 100";
+    }
+    
+    if ($options["max-file-size"] < 1 || $options["max-file-size"] > 1000) {
+        $errors[] = "max-file-size must be between 1 and 1000";
+    }
+    
+    if ($options["max-memory-entries"] < 1000 || $options["max-memory-entries"] > 1000000) {
+        $errors[] = "max-memory-entries must be between 1000 and 1000000";
+    }
+    
+    if (!empty($errors)) {
+        throw new InvalidArgumentException(implode(", ", $errors));
+    }
+    
+    return $options;
 }
 
 function main(array $argv): void {
@@ -1184,17 +1296,27 @@ function main(array $argv): void {
         "no-rsyslog-detection" => false,
         "config-file" => "",
         "version" => false,
+        "help" => false,
     ];
     
     $args = [];
     for ($i = 1; $i < count($argv); $i++) {
-        if (str_starts_with($argv[$i], "--")) {
-            $arg = substr($argv[$i], 2);
-            if (str_contains($arg, "=")) {
-                list($key, $value) = explode("=", $arg, 2);
+        $arg = $argv[$i];
+        if ($arg === "--help" || $arg === "-h") {
+            $options["help"] = true;
+            continue;
+        }
+        if ($arg === "--version" || $arg === "-v") {
+            $options["version"] = true;
+            continue;
+        }
+        if (str_starts_with($arg, "--")) {
+            $argName = substr($arg, 2);
+            if (str_contains($argName, "=")) {
+                list($key, $value) = explode("=", $argName, 2);
                 $args[$key] = $value;
             } else {
-                $args[$arg] = true;
+                $args[$argName] = true;
             }
         }
     }
@@ -1211,9 +1333,34 @@ function main(array $argv): void {
         }
     }
     
-    if ($options["version"]) {
-        echo "RSyslogAnalyzer 4.0.0 (PHP)" . PHP_EOL;
+    if ($options["help"]) {
+        echo "Usage: php rsyslog_analyzer.php [OPTIONS]\n";
+        echo "Options:\n";
+        echo "  --log-file=FILE          Specify log file to analyze\n";
+        echo "  --max-days=DAYS          Analyze logs from last N days (default: 30)\n";
+        echo "  --summary                Display summary statistics\n";
+        echo "  --find-errors            Find and display error logs\n";
+        echo "  --service=SERVICE        Filter by service name\n";
+        echo "  --filter-service=PATTERN Filter by service pattern (wildcards)\n";
+        echo "  --filter-level=LEVEL     Filter by log level\n";
+        echo "  --filter-message=TEXT    Filter by message content\n";
+        echo "  --verbose                Enable verbose output\n";
+        echo "  --no-color               Disable colored output\n";
+        echo "  --version                Display version information\n";
+        echo "  --help                   Display this help message\n";
         return;
+    }
+    
+    if ($options["version"]) {
+        echo "RSyslogAnalyzer 4.0.0 (PHP)\n";
+        return;
+    }
+    
+    try {
+        $options = validateInput($options);
+    } catch (InvalidArgumentException $e) {
+        echo "Error: " . $e->getMessage() . PHP_EOL;
+        exit(1);
     }
     
     $config = [
@@ -1231,10 +1378,6 @@ function main(array $argv): void {
     ];
     
     $analyzer = new RSyslogAnalyzer($options["log-file"], $config);
-    
-    if ($options["system-info"]) {
-        return;
-    }
     
     try {
         $analyzer->loadLogs();
